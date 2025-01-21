@@ -105,8 +105,18 @@ class SiglipAttention(nn.Module):
         attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
 
+        if attn_output.size() != (batch_size, self.num_heads, seq_len, self.head_dim):
+            raise ValueError(
+                f"attn_output should be of size {(batch_size, self.num_heads, seq_len, self.head_dim)}, but is"
+                f"{attn_output.size()}"
+            )
         
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape((batch_size, self.seq_len, self.embed_dim))
 
+        attn_output = self.out_proj(attn_output)
+
+        return attn_output, attn_weights
 
 
 class SiglipMLP(nn.Module):
@@ -131,10 +141,7 @@ class SiglipEncoderLayer(nn.Module):
         self.mlp = SiglipMLP(config)
         self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
     
-    def forward(
-        self,
-        hidden_states: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states, _ = self.self_attn(hidden_states=hidden_states)
@@ -144,6 +151,21 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+class SiglipEncoder(nn.Module):
+    def __init__(self, config: SiglipVisionConfig):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList(
+            [SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+    
+    def forward(self, inputs_embeds):
+        hidden_states = inputs_embeds
+        for encoder_layer in self.layers:
+            hidden_states = encoder_layer(hidden_states)
+        
+        return hidden_states
 
 class SiglipVisionTransformer(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
