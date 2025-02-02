@@ -5,6 +5,40 @@ from torch.nn import CrossEntropyLoss
 import math
 from modeling_siglip import SiglipVisionConfig, SiglipVisionModel
 
+class GemmaConfig():
+    def __init__(
+        self,
+        vocab_size,
+        hidden_size,
+        intermediate_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim=256,
+        max_position_embeddings=8192,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        attention_bias=False,
+        attention_dropout=0.0,
+        pad_token_id=None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.max_position_embeddings
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.head_dim = head_dim
+        self.num_key_value_heads = num_key_value_heads
+        self.rms_norm_eps = rms_norm_eps
+        self.rope_theta = rope_theta
+        self.attention_bias = attention_bias
+        self.attention_dropout = attention_dropout
+        self.pad_token_id = pad_token_id
+        
+
 class PaliGemmaConfig():
 
     def __init__(
@@ -25,7 +59,15 @@ class PaliGemmaConfig():
         self.vocab_size = vocab_size
         self.projection_dim = projection_dim
         self.hidden_size = hidden_size
+        self.vision_config = vision_config
+        self.is_encoder_decoder = False
+        self.pad_token_id = pad_token_id
         
+        self.vision_config = SiglipVisionConfig(**vision_config)
+        self.text_config = text_config
+        
+        self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
+        self.vision_config.projection_dim = projection_dim
 
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
@@ -43,6 +85,59 @@ class PaliGemmaForConditionalGeneration(nn.Module):
     def tie_weights(self):
         return self.language_model.tie_weights()
     
+    def _merge_input_ids_with_image_features(
+        self, image_features, inputs_embeds, input_ids, attention_mask, kv_cache
+    ):
+        _, _, embed_dim = image_features.shape
+        batch_size, sequence_length = input_ids.shape
+        dtype, device = inputs_embeds.dtype, inputs_embeds.device
+        
+        scaled_image_features = image_features / (self.config.hidden_size**0.5)
+        
+        final_embedding = torch.zeros(batch_size, sequence_length, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        
+        text_mask = (input_ids != self.config.image_token_index) & (input_ids != self.pad_token_id)
+        image_mask = input_ids == self.config.image_token_index
+        pad_mask = input_ids == self.pad_token_id
+        
+        text_mask_expanded = text_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
+        pad_mask_expanded = pad_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
+        image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
+        
+        final_embedding = torch.where(text_mask_expanded, inputs_embeds, final_embedding)
+        
+        final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
+        
+        final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
+        
+        dtype, device = inputs_embeds.dtype, inputs_embeds.device
+        min_dtype = torch.finfo(dtype).min
+        q_len = inputs_embeds.shape[1]
+        
+        if kv_cache is None or kv_cache.num_items() == 0:
+            causal_mask = torch.full(
+                (batch_size, q_len, q_len), fill_value=0, dtype=dtype, device=device
+            )
+        else:
+            assert q_len == 1
+            kv_len = kv_cache.num_items() + q_len
+            causal_mask = torch.full(
+                (batch_size, q_len, kv_len), fill_value=0, dtype=dtype, device=device
+            )
+        
+        causal_mask = causal_mask.unsqueeze(1)
+        
+        if kv_cache is not None and kv_cache.num_items() > 0:
+            position_ids = attention_mask.cumsum(-1)[:, -1]
+            if position_ids.dim() == 1:
+                position_ids = position_ids.unsqueeze(0)
+        
+        else:
+            position_ids = (attention_mask.cumsum(-1)).masked_fill_((attention_mask == 0))
+        
+        return final_embedding, causal_mask, position_ids
+            
+        
     def forward(
         self,
         input_ids,
@@ -66,3 +161,5 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             input_embeds=input_embeds,
             kv_cache=kv_cache
         )
+        
+        return outputs
